@@ -1,7 +1,13 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import ExcelJS from "exceljs";
 import type {
   BalanceRow,
+  ClassificationRule,
   DailyBatches,
   DashboardData,
+  ImportDecision,
+  ImportPreviewResult,
   ListType,
   LogsBalance,
   ProductCatalogItem
@@ -11,7 +17,9 @@ import { db } from "./db";
 import { hashFile, hashRow, inferCatalogDefaults, parseWorkbook } from "./importer";
 import type { AdjustmentLineInput, ImportedFile } from "./types";
 
-type EffectiveRow = {
+const TEMPLATE_PATH = resolve("templates", "base-limpia.xlsx");
+
+export type EffectiveRow = {
   id: number;
   movementDate: string;
   listType: ListType;
@@ -29,10 +37,46 @@ type EffectiveRow = {
   logsStage: "elaboracion" | "desmolde" | "sin_clasificar";
 };
 
+export async function previewWorkbookImport(file: ImportedFile): Promise<ImportPreviewResult> {
+  const parsedRows = await parseWorkbook(file.buffer);
+  const templateCodes = await getTemplateCodesForList(file.listType);
+  const grouped = new Map<string, { code: string; description: string; rowCount: number; totalKg: number }>();
+
+  for (const row of parsedRows) {
+    const current = grouped.get(row.code) ?? {
+      code: row.code,
+      description: row.description,
+      rowCount: 0,
+      totalKg: 0
+    };
+    current.rowCount += 1;
+    current.totalKg += Math.abs(row.netKg);
+    grouped.set(row.code, current);
+  }
+
+  const reviewItems = Array.from(grouped.values())
+    .filter((item) => !catalogCodeExists(item.code) || !templateCodes.has(item.code))
+    .map((item) => ({
+      ...item,
+      totalKg: round(item.totalKg),
+      listType: file.listType,
+      existsInCatalog: catalogCodeExists(item.code),
+      existsInTemplate: templateCodes.has(item.code),
+      suggestedGroupName: findMatchingRule(item.description)?.physicalGroupName ?? null
+    }));
+
+  return {
+    totalRows: parsedRows.length,
+    totalKg: round(parsedRows.reduce((sum, row) => sum + row.netKg, 0)),
+    reviewItems
+  };
+}
+
 export async function importWorkbook(file: ImportedFile) {
   const parsedRows = await parseWorkbook(file.buffer);
   const sourceHash = hashFile(file.buffer);
   const totalKg = parsedRows.reduce((sum, row) => sum + row.netKg, 0);
+  const decisions = new Map((file.decisions ?? []).map((decision) => [decision.originalCode, decision]));
 
   const importInfo = db
     .prepare(
@@ -56,14 +100,29 @@ export async function importWorkbook(file: ImportedFile) {
   db.exec("BEGIN");
   try {
     for (const row of parsedRows) {
-      ensureCatalog(row.code, row.description, file.listType);
+      const decision = decisions.get(row.code);
+      if (decision?.action === "exclude") {
+        skippedRows += 1;
+        continue;
+      }
+
+      const rowToStore = {
+        ...row,
+        code: decision?.action === "replace" && decision.targetCode ? decision.targetCode.trim() : row.code,
+        description:
+          decision?.action === "replace" && decision.targetDescription?.trim()
+            ? decision.targetDescription.trim()
+            : row.description
+      };
+
+      ensureCatalog(rowToStore.code, rowToStore.description, file.listType);
       const result = insertRaw.run(
         importId,
         file.movementDate,
         file.listType,
         row.rowIndex,
-        row.code,
-        row.description,
+        rowToStore.code,
+        rowToStore.description,
         row.packages,
         row.units,
         row.netKg,
@@ -99,14 +158,22 @@ export async function importWorkbook(file: ImportedFile) {
 
 export function ensureCatalog(code: string, description: string, listType: string) {
   const defaults = inferCatalogDefaults(description, listType);
+  const rule = findMatchingRule(description);
   db.prepare(
     `INSERT INTO product_catalog
-      (code, description, area, logs_stage, is_shared_byproduct)
-     VALUES (?, ?, ?, ?, ?)
+      (code, description, physical_group_id, area, logs_stage, is_shared_byproduct)
+     VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(code) DO UPDATE SET
       description = excluded.description,
       updated_at = CURRENT_TIMESTAMP`
-  ).run(code, description, defaults.area, defaults.logsStage, defaults.isSharedByproduct ? 1 : 0);
+  ).run(
+    code,
+    description,
+    rule?.physicalGroupId ?? null,
+    rule?.area ?? defaults.area,
+    defaults.logsStage,
+    defaults.isSharedByproduct ? 1 : 0
+  );
 }
 
 export function getGroups() {
@@ -138,7 +205,27 @@ export function getCatalog(): ProductCatalogItem[] {
        ORDER BY pc.is_confirmed, pc.area, pc.description`
     )
     .all()
-    .map(mapBooleans) as ProductCatalogItem[];
+    .map(mapBooleans) as unknown as ProductCatalogItem[];
+}
+
+export function getClassificationRules(): ClassificationRule[] {
+  return db
+    .prepare(
+      `SELECT
+        cr.id,
+        cr.name,
+        cr.pattern,
+        cr.physical_group_id AS physicalGroupId,
+        pg.name AS physicalGroupName,
+        cr.area,
+        cr.priority,
+        cr.is_active AS isActive
+       FROM classification_rules cr
+       JOIN physical_groups pg ON pg.id = cr.physical_group_id
+       ORDER BY cr.priority ASC, cr.id ASC`
+    )
+    .all()
+    .map(mapBooleans) as unknown as ClassificationRule[];
 }
 
 export function updateCatalogItem(
@@ -175,6 +262,11 @@ export function setDailyBatches(date: string, commonCount: number, phillyCount: 
       philly_count = excluded.philly_count,
       updated_at = CURRENT_TIMESTAMP`
   ).run(date, commonCount, phillyCount);
+}
+
+export function startWorkMonth(month: string) {
+  if (!/^\d{4}-\d{2}$/.test(month)) throw new Error("El mes debe tener formato YYYY-MM.");
+  db.prepare("INSERT OR IGNORE INTO work_months (month) VALUES (?)").run(month);
 }
 
 export function getDailyBatches(date: string): DailyBatches {
@@ -253,6 +345,60 @@ export function getEffectiveRows(date: string): EffectiveRow[] {
       ORDER BY rm.created_at DESC, rm.id DESC`
     )
     .all(date) as EffectiveRow[];
+}
+
+export function getEffectiveRowsForMonth(month: string): EffectiveRow[] {
+  if (!/^\d{4}-\d{2}$/.test(month)) throw new Error("El mes debe tener formato YYYY-MM.");
+  return getEffectiveRowsByWhere(`${month}-%`);
+}
+
+export function getMovementDatesForMonth(month: string): string[] {
+  if (!/^\d{4}-\d{2}$/.test(month)) throw new Error("El mes debe tener formato YYYY-MM.");
+  return (
+    db
+      .prepare(
+        `SELECT DISTINCT movement_date AS movementDate
+         FROM raw_movements
+         WHERE movement_date LIKE ?
+         ORDER BY movement_date`
+      )
+      .all(`${month}-%`) as Array<{ movementDate: string }>
+  ).map((row) => row.movementDate);
+}
+
+function getEffectiveRowsByWhere(dateLike: string): EffectiveRow[] {
+  return db
+    .prepare(
+      `WITH latest_revision AS (
+        SELECT raw_movement_id, MAX(id) AS revision_id
+        FROM adjustment_revisions
+        GROUP BY raw_movement_id
+      )
+      SELECT
+        rm.id,
+        rm.movement_date AS movementDate,
+        COALESCE(al.list_type, rm.list_type) AS listType,
+        COALESCE(al.code, rm.code) AS code,
+        COALESCE(al.description, rm.description) AS description,
+        rm.packages,
+        rm.units,
+        rm.net_kg AS netKg,
+        COALESCE(al.net_kg, rm.net_kg) AS effectiveKg,
+        CASE WHEN lr.revision_id IS NULL THEN 0 ELSE 1 END AS isAdjusted,
+        COALESCE(al.is_excluded, 0) AS isExcluded,
+        COALESCE(al.physical_group_id, pc.physical_group_id) AS physicalGroupId,
+        pg.name AS physicalGroupName,
+        COALESCE(pc.area, 'compartido') AS area,
+        COALESCE(al.logs_stage, pc.logs_stage, 'sin_clasificar') AS logsStage
+      FROM raw_movements rm
+      LEFT JOIN latest_revision lr ON lr.raw_movement_id = rm.id
+      LEFT JOIN adjustment_lines al ON al.revision_id = lr.revision_id
+      LEFT JOIN product_catalog pc ON pc.code = COALESCE(al.code, rm.code)
+      LEFT JOIN physical_groups pg ON pg.id = COALESCE(al.physical_group_id, pc.physical_group_id)
+      WHERE rm.movement_date LIKE ?
+      ORDER BY rm.movement_date, rm.id`
+    )
+    .all(dateLike) as EffectiveRow[];
 }
 
 export function saveAdjustment(rawMovementId: number, reason: string, lines: AdjustmentLineInput[]) {
@@ -383,10 +529,89 @@ function round(value: number) {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
-function mapBooleans(row: Record<string, unknown>) {
+function mapBooleans<T extends Record<string, unknown>>(row: T) {
   return {
     ...row,
     isSharedByproduct: Boolean(row.isSharedByproduct),
-    isConfirmed: Boolean(row.isConfirmed)
+    isConfirmed: Boolean(row.isConfirmed),
+    isActive: Boolean(row.isActive)
   };
+}
+
+function findMatchingRule(description: string) {
+  const normalized = normalize(description);
+  const rules = db
+    .prepare(
+      `SELECT
+        cr.physical_group_id AS physicalGroupId,
+        pg.name AS physicalGroupName,
+        cr.area,
+        cr.pattern
+       FROM classification_rules cr
+       JOIN physical_groups pg ON pg.id = cr.physical_group_id
+       WHERE cr.is_active = 1
+       ORDER BY cr.priority ASC, cr.id ASC`
+    )
+    .all() as Array<{
+      physicalGroupId: number;
+      physicalGroupName: string;
+      area: "porcionado" | "logs" | "compartido";
+      pattern: string;
+    }>;
+
+  return rules.find((rule) => new RegExp(rule.pattern, "i").test(normalized));
+}
+
+function catalogCodeExists(code: string) {
+  return Boolean(db.prepare("SELECT 1 FROM product_catalog WHERE code = ?").get(code));
+}
+
+async function getTemplateCodesForList(listType: ListType) {
+  if (!existsSync(TEMPLATE_PATH)) return new Set<string>();
+
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(TEMPLATE_PATH);
+  const sheetName = listType.includes("logs") ? "logs" : "porcionados";
+  const sheet = workbook.getWorksheet(sheetName);
+  if (!sheet) return new Set<string>();
+
+  const { startRow, totalRow } = resolveTemplateSection(sheet, listType);
+  const codes = new Set<string>();
+  for (let row = startRow; row < totalRow; row += 1) {
+    const code = String(sheet.getCell(row, 1).value ?? "").trim();
+    if (code) codes.add(code);
+  }
+  return codes;
+}
+
+function resolveTemplateSection(sheet: ExcelJS.Worksheet, listType: ListType) {
+  if (listType === "entrada_desosado" || listType === "entrada_porcionado") {
+    const salidaRow = findRowByLabel(sheet, "SALIDA", 1, sheet.rowCount);
+    return { startRow: 4, totalRow: findRowByLabel(sheet, "TOTAL", 4, salidaRow) };
+  }
+
+  if (listType === "salida_porcionado") {
+    const salidaRow = findRowByLabel(sheet, "SALIDA", 1, sheet.rowCount);
+    return { startRow: salidaRow + 1, totalRow: findRowByLabel(sheet, "TOTAL", salidaRow + 1, sheet.rowCount) };
+  }
+
+  if (listType === "entrada_logs") {
+    const salidaRow = findRowByLabel(sheet, "Salida Producto Final", 1, sheet.rowCount);
+    return { startRow: 4, totalRow: findRowByLabel(sheet, "Total", 4, salidaRow) };
+  }
+
+  const salidaRow = findRowByLabel(sheet, "Salida Producto Final", 1, sheet.rowCount);
+  return { startRow: salidaRow + 2, totalRow: findRowByLabel(sheet, "Total", salidaRow + 2, sheet.rowCount) };
+}
+
+function findRowByLabel(sheet: ExcelJS.Worksheet, label: string, startRow: number, endRow: number) {
+  const wanted = normalize(label);
+  for (let row = startRow; row <= endRow; row += 1) {
+    if (normalize(String(sheet.getCell(row, 2).value ?? "")) === wanted) return row;
+  }
+  throw new Error(`No se encontro "${label}" en ${sheet.name}`);
+}
+
+function normalize(value: string) {
+  return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase("es");
 }

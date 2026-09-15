@@ -20,6 +20,32 @@ export type ImportResult = {
   totalKg: number;
 };
 
+export type ImportDecisionAction = "add" | "replace" | "exclude";
+
+export type ImportDecision = {
+  originalCode: string;
+  action: ImportDecisionAction;
+  targetCode?: string;
+  targetDescription?: string;
+};
+
+export type ImportPreviewItem = {
+  code: string;
+  description: string;
+  listType: ListType;
+  rowCount: number;
+  totalKg: number;
+  existsInCatalog: boolean;
+  existsInTemplate: boolean;
+  suggestedGroupName: string | null;
+};
+
+export type ImportPreviewResult = {
+  totalRows: number;
+  totalKg: number;
+  reviewItems: ImportPreviewItem[];
+};
+
 export type ProductCatalogItem = {
   code: string;
   description: string;
@@ -29,6 +55,17 @@ export type ProductCatalogItem = {
   logsStage: LogsStage;
   isSharedByproduct: boolean;
   isConfirmed: boolean;
+};
+
+export type ClassificationRule = {
+  id: number;
+  name: string;
+  pattern: string;
+  physicalGroupId: number;
+  physicalGroupName: string;
+  area: Area;
+  priority: number;
+  isActive: boolean;
 };
 
 export type PhysicalGroup = {

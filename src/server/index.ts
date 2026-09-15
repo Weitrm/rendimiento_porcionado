@@ -7,11 +7,14 @@ import { buildExcelReport } from "./exporter";
 import {
   createGroup,
   getCatalog,
+  getClassificationRules,
   getDashboard,
   getGroups,
   importWorkbook,
+  previewWorkbookImport,
   saveAdjustment,
   setDailyBatches,
+  startWorkMonth,
   updateCatalogItem
 } from "./repository";
 
@@ -48,6 +51,26 @@ app.post("/api/imports", upload.single("file"), async (req, res, next) => {
         movementDate,
         listType,
         originalName: req.file.originalname,
+        buffer: req.file.buffer,
+        decisions: parseJsonField(req.body.decisions, [])
+      })
+    );
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/import-preview", upload.single("file"), async (req, res, next) => {
+  try {
+    const movementDate = requireDate(req.body.date);
+    const listType = requireListType(req.body.listType);
+    if (!req.file) throw new Error("Falta adjuntar un archivo Excel.");
+
+    res.json(
+      await previewWorkbookImport({
+        movementDate,
+        listType,
+        originalName: req.file.originalname,
         buffer: req.file.buffer
       })
     );
@@ -81,6 +104,14 @@ app.get("/api/groups", (_req, res, next) => {
   }
 });
 
+app.get("/api/classification-rules", (_req, res, next) => {
+  try {
+    res.json(getClassificationRules());
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/groups", (req, res, next) => {
   try {
     createGroup(req.body.name, req.body.area, req.body.notes ?? null);
@@ -94,6 +125,15 @@ app.put("/api/batches/:date", (req, res, next) => {
   try {
     const date = requireDate(req.params.date);
     setDailyBatches(date, Number(req.body.commonCount ?? 0), Number(req.body.phillyCount ?? 0));
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/months/:month/start", (req, res, next) => {
+  try {
+    startWorkMonth(req.params.month);
     res.json({ ok: true });
   } catch (error) {
     next(error);
@@ -143,4 +183,10 @@ function requireListType(value: unknown): ListType {
   const listType = String(value ?? "") as ListType;
   if (!LIST_TYPES.includes(listType)) throw new Error("Tipo de lista inválido.");
   return listType;
+}
+
+function parseJsonField<T>(value: unknown, fallback: T): T {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value !== "string") return value as T;
+  return JSON.parse(value) as T;
 }

@@ -1,4 +1,4 @@
-import type { ListType, LogsStage } from "../shared/types";
+import type { ImportDecision, ListType, LogsStage } from "../shared/types";
 
 export type ParsedRow = {
   rowIndex: number;
@@ -17,6 +17,7 @@ export type ImportedFile = {
   movementDate: string;
   originalName: string;
   buffer: Buffer;
+  decisions?: ImportDecision[];
 };
 
 export type AdjustmentLineInput = {

@@ -17,7 +17,10 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import type {
   Area,
+  ClassificationRule,
   DashboardData,
+  ImportDecision,
+  ImportPreviewItem,
   ListType,
   LogsStage,
   MovementRow,
@@ -26,16 +29,20 @@ import type {
 } from "../../shared/types";
 import {
   createGroup,
+  fetchClassificationRules,
   fetchDashboard,
   fetchGroups,
   importList,
+  previewImport,
   saveAdjustment,
   saveBatches,
+  startMonth,
   updateCatalog
 } from "./api";
 import { formatKg, formatPercent, listLabels, stageLabels } from "./labels";
 
 type SectionId = "resumen" | "importar" | "balance" | "catalogo" | "ajustes" | "exportar";
+type ReviewItem = ImportPreviewItem & { key: string };
 
 const importOrder: ListType[] = [
   "entrada_desosado",
@@ -61,7 +68,10 @@ export function App() {
   const [date, setDate] = useState(defaultDate);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [groups, setGroups] = useState<PhysicalGroup[]>([]);
+  const [rules, setRules] = useState<ClassificationRule[]>([]);
   const [files, setFiles] = useState<Partial<Record<ListType, File>>>({});
+  const [reviewItems, setReviewItems] = useState<ReviewItem[]>([]);
+  const [importDecisions, setImportDecisions] = useState<Record<string, ImportDecision>>({});
   const [status, setStatus] = useState("Listo.");
   const [busy, setBusy] = useState(false);
   const [commonCount, setCommonCount] = useState(0);
@@ -69,9 +79,14 @@ export function App() {
   const [editingRow, setEditingRow] = useState<MovementRow | null>(null);
 
   async function load() {
-    const [nextDashboard, nextGroups] = await Promise.all([fetchDashboard(date), fetchGroups()]);
+    const [nextDashboard, nextGroups, nextRules] = await Promise.all([
+      fetchDashboard(date),
+      fetchGroups(),
+      fetchClassificationRules()
+    ]);
     setDashboard(nextDashboard);
     setGroups(nextGroups);
+    setRules(nextRules);
     setCommonCount(nextDashboard.batches.commonCount);
     setPhillyCount(nextDashboard.batches.phillyCount);
   }
@@ -82,22 +97,84 @@ export function App() {
 
   async function handleImportAll() {
     setBusy(true);
-    setStatus("Importando listas...");
+    setStatus("Revisando codigos...");
     try {
       const selected = importOrder.filter((type) => files[type]);
-      for (const listType of selected) {
-        const file = files[listType]!;
-        const result = await importList(date, listType, file);
-        setStatus(`${listLabels[listType]}: ${result.insertedRows} nuevas, ${result.skippedRows} repetidas.`);
+      const previews = await Promise.all(
+        selected.map(async (listType) => ({
+          listType,
+          preview: await previewImport(date, listType, files[listType]!)
+        }))
+      );
+      const nextReviewItems = previews.flatMap(({ listType, preview }) =>
+        preview.reviewItems.map((item) => ({ ...item, key: `${listType}:${item.code}` }))
+      );
+
+      if (nextReviewItems.length > 0) {
+        setReviewItems(nextReviewItems);
+        setImportDecisions(
+          Object.fromEntries(
+            nextReviewItems.map((item) => [
+              item.key,
+              {
+                originalCode: item.code,
+                action: "add",
+                targetCode: item.code,
+                targetDescription: item.description
+              } satisfies ImportDecision
+            ])
+          )
+        );
+        setStatus(`${nextReviewItems.length} codigos necesitan revision antes de importar.`);
+        return;
       }
-      await load();
-      setStatus("Importacion terminada.");
-      setActiveSection("balance");
+
+      await importSelectedFiles(selected, {});
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "No se pudo importar.");
     } finally {
       setBusy(false);
     }
+  }
+
+  async function handleConfirmReviewedImport() {
+    setBusy(true);
+    setStatus("Importando con decisiones confirmadas...");
+    try {
+      const selected = importOrder.filter((type) => files[type]);
+      await importSelectedFiles(selected, importDecisions);
+      setReviewItems([]);
+      setImportDecisions({});
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "No se pudo importar.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importSelectedFiles(selected: ListType[], decisionsByKey: Record<string, ImportDecision>) {
+    setStatus("Importando listas...");
+    for (const listType of selected) {
+      const file = files[listType]!;
+      const decisions = Object.entries(decisionsByKey)
+        .filter(([key]) => key.startsWith(`${listType}:`))
+        .map(([, decision]) => decision);
+      const result = await importList(date, listType, file, decisions);
+      setStatus(`${listLabels[listType]}: ${result.insertedRows} nuevas, ${result.skippedRows} omitidas/repetidas.`);
+    }
+    await load();
+    setStatus("Importacion terminada.");
+    setActiveSection("balance");
+  }
+
+  function updateDecision(key: string, patch: Partial<ImportDecision>) {
+    setImportDecisions((current) => ({
+      ...current,
+      [key]: {
+        ...current[key],
+        ...patch
+      }
+    }));
   }
 
   async function handleSaveBatches() {
@@ -190,6 +267,10 @@ export function App() {
             setCommonCount={setCommonCount}
             setPhillyCount={setPhillyCount}
             onImport={handleImportAll}
+            reviewItems={reviewItems}
+            decisions={importDecisions}
+            onDecisionChange={updateDecision}
+            onConfirmReviewedImport={handleConfirmReviewedImport}
             onSaveBatches={handleSaveBatches}
           />
         )}
@@ -200,6 +281,7 @@ export function App() {
           <CatalogPanel
             items={dashboard?.unknownProducts ?? []}
             groups={groups}
+            rules={rules}
             onReload={load}
             onSave={handleCatalogSave}
           />
@@ -209,7 +291,7 @@ export function App() {
           <RowsPanel rows={dashboard?.recentRows ?? []} groups={groups} onAdjust={setEditingRow} />
         )}
 
-        {activeSection === "exportar" && <ExportPage date={date} dashboard={dashboard} />}
+        {activeSection === "exportar" && <ExportPage date={date} dashboard={dashboard} setStatus={setStatus} />}
       </main>
 
       {editingRow && (
@@ -288,21 +370,29 @@ function ImportPage({
   busy,
   files,
   setFiles,
+  reviewItems,
+  decisions,
   commonCount,
   phillyCount,
   setCommonCount,
   setPhillyCount,
   onImport,
+  onDecisionChange,
+  onConfirmReviewedImport,
   onSaveBatches
 }: {
   busy: boolean;
   files: Partial<Record<ListType, File>>;
   setFiles: React.Dispatch<React.SetStateAction<Partial<Record<ListType, File>>>>;
+  reviewItems: ReviewItem[];
+  decisions: Record<string, ImportDecision>;
   commonCount: number;
   phillyCount: number;
   setCommonCount: (value: number) => void;
   setPhillyCount: (value: number) => void;
   onImport: () => Promise<void>;
+  onDecisionChange: (key: string, patch: Partial<ImportDecision>) => void;
+  onConfirmReviewedImport: () => Promise<void>;
   onSaveBatches: () => Promise<void>;
 }) {
   return (
@@ -334,6 +424,70 @@ function ImportPage({
             </label>
           ))}
         </div>
+
+        {reviewItems.length > 0 && (
+          <div className="review-box">
+            <div className="panel-header">
+              <div>
+                <h2>Codigos para revisar</h2>
+                <p>Confirmar antes de grabar la importacion y antes de agregarlos al Excel mensual.</p>
+              </div>
+              <button className="primary compact" disabled={busy} onClick={onConfirmReviewedImport}>
+                <Check size={16} />
+                Confirmar importacion
+              </button>
+            </div>
+            <div className="table">
+              <div className="table-row table-head review-grid">
+                <span>Lista</span>
+                <span>Codigo</span>
+                <span>Descripcion</span>
+                <span>Kg</span>
+                <span>Decision</span>
+                <span>Codigo destino</span>
+              </div>
+              {reviewItems.map((item) => {
+                const decision = decisions[item.key];
+                return (
+                  <div className="table-row review-grid" key={item.key}>
+                    <span>{listLabels[item.listType]}</span>
+                    <span>
+                      {item.code}
+                      <small>{item.existsInTemplate ? "Existe en plantilla" : "No esta en plantilla"}</small>
+                    </span>
+                    <span>
+                      {item.description}
+                      {item.suggestedGroupName && <small>Sugerido: {item.suggestedGroupName}</small>}
+                    </span>
+                    <span>{formatKg(item.totalKg)} kg</span>
+                    <select
+                      value={decision?.action ?? "add"}
+                      onChange={(event) =>
+                        onDecisionChange(item.key, { action: event.target.value as ImportDecision["action"] })
+                      }
+                    >
+                      <option value="add">Agregar con este codigo</option>
+                      <option value="replace">Asignar/cambiar codigo</option>
+                      <option value="exclude">Excluir</option>
+                    </select>
+                    <div className="stacked-inputs">
+                      <input
+                        disabled={decision?.action !== "replace"}
+                        value={decision?.targetCode ?? item.code}
+                        onChange={(event) => onDecisionChange(item.key, { targetCode: event.target.value })}
+                      />
+                      <input
+                        disabled={decision?.action !== "replace"}
+                        value={decision?.targetDescription ?? item.description}
+                        onChange={(event) => onDecisionChange(item.key, { targetDescription: event.target.value })}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="panel">
@@ -400,20 +554,40 @@ function BalancePage({ dashboard, compact = false }: { dashboard: DashboardData 
   );
 }
 
-function ExportPage({ date, dashboard }: { date: string; dashboard: DashboardData | null }) {
+function ExportPage({
+  date,
+  dashboard,
+  setStatus
+}: {
+  date: string;
+  dashboard: DashboardData | null;
+  setStatus: (value: string) => void;
+}) {
+  const month = date.slice(0, 7);
+
+  async function handleStartMonth() {
+    await startMonth(month);
+    setStatus(`Mes ${month} iniciado desde plantilla limpia.`);
+  }
+
   return (
     <section className="panel export-panel">
       <FileSpreadsheet size={34} />
-      <h2>Informe Excel</h2>
-      <p>Incluye resumen, detalle de movimientos efectivos y productos pendientes.</p>
+      <h2>Planilla mensual</h2>
+      <p>Se genera desde la plantilla limpia y carga los dias importados del mes en porcionados y logs.</p>
       <div className="export-facts">
-        <span>{dashboard?.recentRows.length ?? 0} filas visibles</span>
+        <span>Mes {month}</span>
+        <span>{dashboard?.recentRows.length ?? 0} filas del dia visibles</span>
         <span>{dashboard?.unknownProducts.length ?? 0} productos pendientes</span>
         <span>{formatKg(dashboard?.batches.recipeKg ?? 0)} kg receta Logs</span>
       </div>
+      <button className="secondary" onClick={handleStartMonth}>
+        <Plus size={18} />
+        Iniciar mes
+      </button>
       <a className="primary" href={`/api/export?date=${date}`}>
         <Download size={18} />
-        Descargar Excel
+        Descargar mes en Excel
       </a>
     </section>
   );
@@ -507,11 +681,13 @@ function FunctionTile({
 function CatalogPanel({
   items,
   groups,
+  rules,
   onReload,
   onSave
 }: {
   items: ProductCatalogItem[];
   groups: PhysicalGroup[];
+  rules: ClassificationRule[];
   onReload: () => Promise<void>;
   onSave: (item: ProductCatalogItem, patch: Partial<ProductCatalogItem>) => Promise<void>;
 }) {
@@ -549,6 +725,14 @@ function CatalogPanel({
           <Plus size={16} />
           Crear grupo
         </button>
+      </div>
+
+      <div className="rule-strip">
+        {rules.map((rule) => (
+          <span key={rule.id}>
+            {rule.pattern} {"->"} {rule.physicalGroupName}
+          </span>
+        ))}
       </div>
 
       <div className="table">

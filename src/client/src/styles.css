@@ -441,6 +441,10 @@ dd {
   grid-template-columns: minmax(120px, 0.8fr) 90px minmax(240px, 1.7fr) 110px minmax(130px, 1fr) 44px;
 }
 
+.review-grid {
+  grid-template-columns: minmax(130px, 0.8fr) 100px minmax(260px, 1.5fr) 100px minmax(180px, 0.9fr) minmax(180px, 1fr);
+}
+
 .table-row small {
   display: block;
   color: #8c6a18;
@@ -481,6 +485,43 @@ dd {
 .new-group {
   grid-template-columns: minmax(180px, 1fr) 160px auto;
   margin-top: 14px;
+}
+
+.review-box {
+  margin-top: 18px;
+  border-top: 1px solid #e2e2da;
+  padding-top: 18px;
+}
+
+.stacked-inputs {
+  display: grid;
+  gap: 6px;
+}
+
+.stacked-inputs input {
+  min-height: 32px;
+}
+
+.stacked-inputs input:disabled {
+  background: #eceee8;
+  color: #7d877e;
+}
+
+.rule-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.rule-strip span {
+  background: #eef1ea;
+  border: 1px solid #d9ded6;
+  border-radius: 999px;
+  padding: 7px 10px;
+  font-size: 12px;
+  font-weight: 750;
+  color: #405146;
 }
 
 .search {
@@ -603,5 +644,9 @@ dd {
 
   .table-row {
     min-width: 850px;
+  }
+
+  .review-grid {
+    min-width: 1120px;
   }
 }
